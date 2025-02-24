@@ -2,6 +2,7 @@ import os
 import gspread
 import pandas as pd
 import asyncio
+import re
 from yt_dlp import YoutubeDL
 from oauth2client.service_account import ServiceAccountCredentials
 from dotenv import load_dotenv  # Importar dotenv
@@ -23,7 +24,7 @@ client = gspread.authorize(creds)
 sheet = client.open_by_key(SHEET_ID).sheet1  
 
 # Crear carpeta de descargas si no existe
-download_folder = "descargas_mp3"
+download_folder = "downloads"
 os.makedirs(download_folder, exist_ok=True)
 
 # Configuración de yt-dlp
@@ -38,6 +39,16 @@ async def enviar_audio_telegram_async(file_path):
     with open(file_path, "rb") as audio:
         await bot.send_audio(chat_id=CHAT_ID, audio=audio)
     print(f"✅ Audio enviado por Telegram: {file_path}")
+
+async def enviar_video_telegram_async(file_path):
+    bot = Bot(token=TOKEN)
+    with open(file_path, "rb") as video:
+        await bot.send_video(chat_id=CHAT_ID, video=video)
+    print(f"✅ Video enviado por Telegram: {file_path}")
+
+def limpiar_nombre(nombre):
+    """Elimina caracteres no permitidos en nombres de archivo."""
+    return re.sub(r'[<>:"/\\|?*]', '', nombre)
 
 def obtener_nombre_mp3(info):
     """Obtiene el nombre del archivo MP3 descargado."""
@@ -54,38 +65,80 @@ def obtener_datos():
     """Obtiene los datos de Google Sheets como DataFrame."""
     return pd.DataFrame(sheet.get_all_records())
 
-def actualizar_google_sheets(url, estado, nombre=None):
+def actualizar_google_sheets(url, formato, estado, nombre=None):
     """Actualiza el estado y nombre del video en Google Sheets."""
     celdas = sheet.findall(url)
     for celda in celdas:
-        sheet.update_cell(celda.row, 2, estado)  # Columna 2 es "Estado"
+        sheet.update_cell(celda.row, 3, estado)  # Columna 3 es "Estado"
+        if formato:
+            sheet.update_cell(celda.row, 2, formato)  # Columna 2 es "Formato"
         if nombre:
-            sheet.update_cell(celda.row, 3, nombre)  # Columna 3 es "Nombre"
+            sheet.update_cell(celda.row, 4, nombre)  # Columna 4 es "Nombre"
 
-def descargar_video(url):
-    """Descarga un video de YouTube y lo convierte a MP3."""
+def descargar_video(url, formato):
+    """Descarga un video de YouTube en MP3 o MP4."""    
+    opciones = {
+        "mp3": {
+            'format': 'bestaudio',
+            'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}],
+            'outtmpl': os.path.join(download_folder, '%(title)s.%(ext)s'),
+        },
+        "mp4": {
+            'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]',
+            'merge_output_format': 'mp4',
+            'postprocessors': [{
+                'key': 'FFmpegVideoConvertor',
+                'preferedformat': 'mp4'  # Usa FFmpeg para convertir y fusionar
+            }],
+            'outtmpl': os.path.join(download_folder, '%(title)s.%(ext)s'),
+        }
+    }
+
+    ydl_opts = opciones.get(formato, opciones["mp3"])
+
     with YoutubeDL(ydl_opts) as ydl:
         try:
             print(f"📥 Descargando: {url}")
             info = ydl.extract_info(url, download=True)
-            mp3_file = obtener_nombre_mp3(info)
-            if mp3_file:
-                asyncio.run(enviar_audio_telegram_async(mp3_file))
+            video_title = info.get('title', 'video')
+
+            # Obtener el archivo final generado
+            archivo_descargado = info.get('requested_downloads', [{}])[0].get('filepath')
+           
+            # # Si no se encuentra, intentar manualmente con el título
+            # if not archivo_descargado:
+            #     video_title = limpiar_nombre(info.get('title', 'video'))
+            #     archivo_descargado = os.path.join(download_folder, f"{video_title}.{formato}")
+
+            # # Verificar si el archivo existe antes de continuar
+            # if not os.path.exists(archivo_descargado):
+            #     print(f"⚠ No se encontró el archivo: {archivo_descargado}")
+            #     return 
+
+            if formato == "mp3":
+                asyncio.run(enviar_audio_telegram_async(archivo_descargado))
+            # elif formato == "mp4":
+            #     asyncio.run(enviar_video_telegram_async(archivo_descargado))
             else:
-                print("⚠ No se encontró un archivo MP3.")
-            video_title = info.get('title', 'Desconocido')
-            actualizar_google_sheets(url, "Descargado", video_title)
-            print(f"✅ Descargado: {video_title}")
+                print(f"⚠ No se encontró un archivo {formato}.") 
+
+            # Actualizando Google Sheets
+            actualizar_google_sheets(url, formato, "Descargado", limpiar_nombre(video_title))
+            print(f"✅ Descargado: {limpiar_nombre(video_title)}")
         except Exception as e:
             print(f"❌ Error al descargar {url}: {e}")
 
 def agregar_url():
     """Permite ingresar una nueva URL y descargar el video."""
     url = input("Ingrese la URL del video: ").strip()
+    formato = input("Seleccione formato (mp3/mp4): ").strip().lower()
+    if formato not in ["mp3", "mp4"]:
+        print("📥 Formato. Se usará MP3 por defecto.")
+        formato = "mp3"
     nombre = input("Ingrese el nombre del video (opcional): ").strip()
-    sheet.append_row([url, "Pendiente", nombre])
+    sheet.append_row([url, formato, "Pendiente", nombre])
     print(f"✅ URL agregada con éxito: {url}")
-    descargar_video(url)
+    descargar_video(url, formato)
 
 def actualizar_estado():
     """Permite actualizar el estado de una URL en Google Sheets."""
@@ -101,7 +154,7 @@ def descargar_videos_pendientes():
     df = obtener_datos()
     for _, row in df.iterrows():
         if row.get("Estado", "Falta") != "Descargado":
-            descargar_video(row['URL'])
+            descargar_video(row['URL'], row['Formato'])
     print("📂 Proceso finalizado. Google Sheets actualizado.")
 
 # Menú interactivo
